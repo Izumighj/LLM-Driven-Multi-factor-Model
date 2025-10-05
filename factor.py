@@ -243,7 +243,140 @@ class FactorCalculator:
         cmra_df.rename(columns={'log_ret': 'CMRA', 'level_1': 'original_index'}, inplace=True)
     
         return cmra_df[['original_index', 'CMRA']]
+    
+    # 将这个新方法添加到您的 FactorCalculator 类中
 
+    def compute_nlsize(self):
+        """
+        计算非线性规模因子 (NonLinear Size)。
+        因子定义：将股票总市值对数的三次方对总市值对数进行横截面回归，取残差的相反数。
+        """
+        print("Computing NonLinear Size (NLSIZE) factor...")
+
+        # 1. 确保基础的SIZE因子存在
+        if 'SIZE' not in self.master_df.columns:
+            self.master_df['SIZE'] = np.log(self.master_df['total_mv'])
+
+        # 2. 计算SIZE因子的三次方
+        self.master_df['SIZE_CUBE'] = self.master_df['SIZE']**3
+
+        # 定义用于横截面回归的函数
+        def _nlsize_regression(daily_df: pd.DataFrame) -> pd.Series:
+            """对每日的截面数据进行回归"""
+            # 移除缺失值
+            valid_data = daily_df[['SIZE', 'SIZE_CUBE']].dropna()
+
+            # 如果有效数据不足以进行回归，则返回空值
+            if valid_data.shape[0] < 2:
+                return pd.Series(np.nan, index=daily_df.index)
+
+            # 准备回归的X和y
+            y = valid_data['SIZE_CUBE']
+            X = sm.add_constant(valid_data['SIZE'])
+
+            # 执行OLS回归
+            model = sm.OLS(y, X).fit()
+
+            # 获取残差
+            residuals = pd.Series(model.resid, index=valid_data.index)
+
+            # 将残差匹配回原始索引，并取其相反数
+            # 对于没有参与回归的行（因为是NaN），结果也是NaN
+            nlsize = -residuals.reindex(daily_df.index)
+
+            return nlsize
+
+        tqdm.pandas(desc="NLSIZE Cross-sectional Regression")
+    
+        # 3. 按交易日分组，对每个截面应用回归函数
+        # 使用 .transform 是一个高效的方法，它会返回一个与原df索引相同的Series
+        nlsize_s = self.master_df.groupby('trade_date').progress_apply(_nlsize_regression)
+    
+        # 4. 格式化结果并返回
+        # 由于groupby.apply可能会改变索引结构，我们重新整理
+        nlsize_s = nlsize_s.reset_index(level=0, drop=True).sort_index()
+
+        nlsize_df = pd.DataFrame({
+            'original_index': self.master_df['original_index'],
+            'NLSIZE': nlsize_s
+        })
+
+        # 清理临时列
+        self.master_df.drop(columns=['SIZE', 'SIZE_CUBE'], inplace=True, errors='ignore')
+
+        return nlsize_df[['original_index', 'NLSIZE']]
+    
+    def compute_bp(self):
+        """
+        计算估值因子 BP (Book-to-Price)。
+        因子定义：市净率(PB)的倒数。
+        """
+        print("Computing Value (BP) factor...")
+
+        # 检查必需的 'pb' 列是否存在
+        if 'pb' not in self.master_df.columns:
+            print("\nERROR: 'pb' column not found in the input data.")
+            print("To compute the BP factor, you must provide Price-to-Book ratio data.\n")
+            return None  # 返回None以中断计算
+
+        # 提取PB序列
+        pb_series = self.master_df['pb']
+    
+        # 计算BP = 1 / PB
+        # 当市净率小于等于0时，其倒数无经济意义，我们将其设为缺失值(NaN)
+        bp_values = np.where(pb_series > 0, 1 / pb_series, np.nan)
+
+        # 构建并返回结果DataFrame
+        bp_df = pd.DataFrame({
+            'original_index': self.master_df['original_index'],
+            'BP': bp_values
+        })
+    
+        return bp_df[['original_index', 'BP']]
+    # 将这个新方法添加到您的 FactorCalculator 类中
+
+    def compute_liquidity(self):
+        """
+        计算原始的流动性因子 STOM, STOQ, STOA。
+        它们分别是月度、季度、年度的对数累计换手率。
+        """
+        print("Computing base Liquidity factors (STOM, STOQ, STOA)...")
+
+        # 1. 检查必需的 'turnover_rate' 列是否存在
+        if 'turnover_rate' not in self.master_df.columns:
+            print(f"\nERROR: 'turnover_rate' column not found in the input data.\n")
+            return None
+
+        # 2. 获取日度换手率，并将其从百分比转换成比率
+        # turnover_rate' 的单位是百分比 (e.g., 1.5 代表 1.5%)，所以除以100 !!!
+        # 如果您的数据本身就是比率（e.g., 0.015），请移除 / 100
+        dtv = self.master_df['turnover_rate'] / 100.0
+    
+        # 3. 按股票分组，计算滚动累计换手率
+        grouped_dtv = dtv.groupby(self.master_df['ts_code'])
+
+    
+        # 使用 .progress_apply 和 .rolling().sum() 来显示进度
+        tqdm.pandas(desc="Calculating rolling turnover")
+        stom_base = grouped_dtv.progress_apply(lambda x: x.rolling(window=21, min_periods=15).sum())
+        stoq_base = grouped_dtv.progress_apply(lambda x: x.rolling(window=63, min_periods=42).sum())
+        stoa_base = grouped_dtv.progress_apply(lambda x: x.rolling(window=252, min_periods=126).sum())
+    
+        # 对累计换手率取对数。np.log(0)会得到-inf，所以我们处理小于等于0的情况
+        stom = np.log(stom_base.replace(0, np.nan))
+        stoq = np.log(stoq_base.replace(0, np.nan))
+        stoa = np.log(stoa_base.replace(0, np.nan))
+
+        # 构建并返回结果 DataFrame
+        liquidity_df = pd.DataFrame({
+            'original_index': self.master_df.index,
+            'STOM': stom.values,
+            'STOQ': stoq.values,
+            'STOA': stoa.values
+        })
+
+
+        return liquidity_df
     # ... 您可以继续添加 compute_cmra, compute_stom 等等 ...
         
     # =================================================================
@@ -270,6 +403,9 @@ class FactorCalculator:
             'DASTD': self.compute_dastd,
             'CMRA': self.compute_cmra,
             'HSIGMA': self.compute_beta_hsigma,  # HSIGMA和BETA一起计算
+            'NLSIZE': self.compute_nlsize,
+            'BP': self.compute_bp,
+            'LIQUIDITY': self.compute_liquidity,
             # ... 在这里继续添加映射 ...
         }
         
@@ -309,8 +445,8 @@ if __name__ == '__main__':
 
     # 获取当前脚本所在目录
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    stk_path = os.path.join(BASE_DIR, "csi300_data_20200101_20250922.csv")
-    index_path = os.path.join(BASE_DIR, "csi_300_index_20200101_20250930.csv")
+    stk_path = os.path.join(BASE_DIR, "data/csi300_data_20200101_20250922.csv")
+    index_path = os.path.join(BASE_DIR, "data/csi_300_index_20200101_20250930.csv")
     stk_data = pd.read_csv(stk_path)
     index_data = pd.read_csv(index_path)
     
@@ -320,7 +456,7 @@ if __name__ == '__main__':
     
     
     # 3. 指定要计算的因子列表，并运行
-    factors_to_run = ['BETA', 'RSTR', 'SIZE', 'DASTD', 'CMRA', 'HSIGMA']
+    factors_to_run = ['LIQUIDITY']
     all_factors_df = calculator.run(factors_to_run)
     
 
