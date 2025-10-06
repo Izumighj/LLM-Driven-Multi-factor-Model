@@ -44,7 +44,7 @@ class FactorCalculator:
         print("Preparing base data (returns, etc.)...")
         # --- 确保数据类型和顺序 ---
         for df in [self.prices_df, self.index_df]:
-            df['trade_date'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
+            df['trade_date'] = pd.to_datetime(df['trade_date'])
         
         self.prices_df.sort_values(by=['ts_code', 'trade_date'], inplace=True)
         self.index_df.sort_values(by='trade_date', inplace=True)
@@ -377,6 +377,133 @@ class FactorCalculator:
 
 
         return liquidity_df
+    
+    # 将这个新方法添加到您的 FactorCalculator 类中
+
+    # 用这个新版本替换掉您旧的 compute_earnings_yield 方法
+
+    def compute_earnings_yield(self):
+        """
+        计算盈利因子 CETOP 和 ETOP。
+        - CETOP: 经营现金流TTM / 总市值
+        - ETOP: 1 / PE_ttm (市盈率倒数)
+        """
+        print("Computing Earnings Yield factors (CETOP, ETOP)...")
+
+        # 1. 更新检查的必需列
+        # CETOP 需要 'n_cashflow_act_ttm' 和 'total_mv'
+        # ETOP 需要 'pe_ttm'
+        required_cols = ['n_cashflow_act_ttm', 'total_mv', 'pe_ttm']
+        if not all(col in self.master_df.columns for col in required_cols):
+            print(f"\nERROR: Missing required columns for earnings yield calculation. "
+                f"Please ensure your merged data contains: {required_cols}\n")
+            return None
+
+        # --- CETOP 计算 (新逻辑) ---
+        cash_flow_ttm = self.master_df['n_cashflow_act_ttm']
+        total_mv = self.master_df['total_mv']
+    
+        # 当总市值 > 0 且 现金流TTM > 0 时，因子才有意义
+        # 这与我们处理PE倒数的逻辑保持一致
+        cetop_values = np.where(
+            (total_mv > 0) & (cash_flow_ttm > 0),
+            cash_flow_ttm / total_mv,
+            np.nan
+        )
+    
+        # --- ETOP 计算 (逻辑不变) ---
+        pe_series = self.master_df['pe_ttm']
+        # 当 PE > 0 时，因子才有意义
+        etop_values = np.where(pe_series > 0, 1 / pe_series, np.nan)
+    
+        # 4. 构建并返回结果 DataFrame
+        earnings_df = pd.DataFrame({
+            'original_index': self.master_df['original_index'],
+            'CETOP': cetop_values,
+            'ETOP': etop_values
+        })
+    
+        return earnings_df
+    # 将这个新方法添加到您的 FactorCalculator 类中
+
+    def select_growth_factors(self):
+        """
+        从主数据表中选取已经过时点对齐的成长因子。
+        - YOYProfit: q_profit_yoy (单季度净利同比增长率)
+        - YOYSales: q_sales_yoy (单季度营收同比增长率)
+        """
+        print("Selecting Growth factors (YOYProfit, YOYSales)...")
+
+        # 1. 检查必需的原始列是否存在
+        required_cols = ['q_profit_yoy', 'q_sales_yoy']
+        if not all(col in self.master_df.columns for col in required_cols):
+            print(f"\nERROR: Missing required columns for growth factors. "
+                f"Please ensure your merged data contains: {required_cols}\n")
+            return None
+
+        # 2. 构建并返回结果 DataFrame
+        # 直接选取并重命名列
+        growth_df = self.master_df[['original_index', 'q_profit_yoy', 'q_sales_yoy']].copy()
+        #原序列是百分比，需要转化为比值
+        growth_df['q_profit_yoy'] = growth_df['q_profit_yoy']/100
+        growth_df['q_sales_yoy'] = growth_df['q_sales_yoy']/100
+        growth_df.rename(columns={
+            'q_profit_yoy': 'YOYProfit',
+            'q_sales_yoy': 'YOYSales'
+        }, inplace=True)
+    
+        return growth_df
+
+    # 将这个新方法添加到您的 FactorCalculator 类中
+
+    def compute_leverage(self):
+        """
+        计算杠杆因子 MLEV, DTOA, BLEV。
+        此方法要求 master_df 中已包含对齐好的日度基本面数据。
+        """
+        print("Computing Leverage factors (MLEV, DTOA, BLEV)...")
+
+        # 1. 定义并检查所需的列名
+        required_cols = [
+            'total_mv', 'total_ncl', 
+            'total_hldr_eqy_inc_min_int', 'debt_to_assets'
+        ]
+        if not all(col in self.master_df.columns for col in required_cols):
+            print(f"\nERROR: Missing required columns for leverage calculation. "
+                f"Please ensure your merged data contains: {required_cols}\n")
+            return None
+
+        # 2. 计算各个杠杆因子
+
+        # MLEV = (总市值 + 非流动负债) / 总市值
+        # total_mv = total_mv, total_ncl = 非流动负债
+        mlev = (self.master_df['total_mv'] + self.master_df['total_ncl']) / self.master_df['total_mv']
+        mlev.replace([np.inf, -np.inf], np.nan, inplace=True) # 处理总市值为0的特殊情况
+
+        # DTOA = 资产负债率
+        # 直接使用您数据中提供的 debt_to_assets 列
+        dtoa = self.master_df['debt_to_assets']
+    
+        # BLEV = (账面价值 + 非流动负债) / 账面价值
+        # total_hldr_eqy_inc_min_int = 账面价值
+        book_value = self.master_df['total_hldr_eqy_inc_min_int']
+        # 当账面价值为负或为0时，该因子无经济意义，设为NaN
+        blev = np.where(
+            book_value > 0,
+            (book_value + self.master_df['total_ncl']) / book_value,
+            np.nan
+        )
+    
+        # 3. 构建并返回结果 DataFrame
+        leverage_df = pd.DataFrame({
+            'original_index': self.master_df['original_index'],
+            'MLEV': mlev,
+            'DTOA': dtoa,
+            'BLEV': blev
+        })
+    
+        return leverage_df
+
     # ... 您可以继续添加 compute_cmra, compute_stom 等等 ...
         
     # =================================================================
@@ -398,14 +525,16 @@ class FactorCalculator:
         
         factor_methods = {
             'SIZE': self.compute_size,
-            'BETA': self.compute_beta_hsigma,
+            'BETA': self.compute_beta_hsigma,  # HSIGMA和BETA一起计算
             'RSTR': self.compute_rstr,
             'DASTD': self.compute_dastd,
             'CMRA': self.compute_cmra,
-            'HSIGMA': self.compute_beta_hsigma,  # HSIGMA和BETA一起计算
             'NLSIZE': self.compute_nlsize,
             'BP': self.compute_bp,
             'LIQUIDITY': self.compute_liquidity,
+            'EARNINGS':self.compute_earnings_yield,
+            'GROWTH': self.select_growth_factors,
+            'LEVERAGE': self.compute_leverage
             # ... 在这里继续添加映射 ...
         }
         
@@ -435,7 +564,8 @@ class FactorCalculator:
         final_df.drop(columns='original_index', inplace=True)
         print("Factor calculation complete.")
         return final_df
-
+    
+    
 # =================================================================
 # ========================== 如何使用 =============================
 # =================================================================
@@ -445,7 +575,7 @@ if __name__ == '__main__':
 
     # 获取当前脚本所在目录
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    stk_path = os.path.join(BASE_DIR, "data/csi300_data_20200101_20250922.csv")
+    stk_path = os.path.join(BASE_DIR, "data/csi300_stk_data_financial_index_balance_cashflow.csv")
     index_path = os.path.join(BASE_DIR, "data/csi_300_index_20200101_20250930.csv")
     stk_data = pd.read_csv(stk_path)
     index_data = pd.read_csv(index_path)
@@ -456,7 +586,7 @@ if __name__ == '__main__':
     
     
     # 3. 指定要计算的因子列表，并运行
-    factors_to_run = ['LIQUIDITY']
+    factors_to_run = ['RSTR']
     all_factors_df = calculator.run(factors_to_run)
     
 
