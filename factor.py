@@ -15,12 +15,7 @@ class FactorCalculator:
     2. 实例化计算器: calculator = FactorCalculator(prices_df, index_df)
     3. 运行计算: all_factors_df = calculator.run(['BETA', 'RSTR', 'SIZE', ...])
     """
-    COMPOSITE_FACTORS = {
-        'VOLATILITY': {
-            'components': ['DASTD', 'CMRA', 'HSIGMA'],
-            'weights': [0.7, 0.15, 0.15]
-        }
-    }
+
     def __init__(self, prices_df: pd.DataFrame, index_df: pd.DataFrame):
         """
         初始化计算器并准备基础数据。
@@ -44,7 +39,7 @@ class FactorCalculator:
         print("Preparing base data (returns, etc.)...")
         # --- 确保数据类型和顺序 ---
         for df in [self.prices_df, self.index_df]:
-            df['trade_date'] = pd.to_datetime(df['trade_date'])
+            df['trade_date'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
         
         self.prices_df.sort_values(by=['ts_code', 'trade_date'], inplace=True)
         self.index_df.sort_values(by='trade_date', inplace=True)
@@ -575,7 +570,8 @@ if __name__ == '__main__':
 
     # 获取当前脚本所在目录
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    stk_path = os.path.join(BASE_DIR, "data/csi300_stk_data_financial_index_balance_cashflow.csv")
+    stk_path = os.path.join(BASE_DIR, "data/csi300_data_20200101_20250922.csv")
+    #stk_path = os.path.join(BASE_DIR, "data/csi300_stk_data_financial_index_balance_cashflow.csv")
     index_path = os.path.join(BASE_DIR, "data/csi_300_index_20200101_20250930.csv")
     stk_data = pd.read_csv(stk_path)
     index_data = pd.read_csv(index_path)
@@ -586,10 +582,17 @@ if __name__ == '__main__':
     
     
     # 3. 指定要计算的因子列表，并运行
-    factors_to_run = ['RSTR']
+    factor_list = ['SIZE', 'RSTR', 'DASTD','CMRA', 'NLSIZE','BP','LIQUIDITY','EARNINGS','GROWTH','LEVERAGE']
+    factors_to_run = ['BETA']
+    #factors_to_run = factor_list
     all_factors_df = calculator.run(factors_to_run)
     
 
+
     # 4. 查看最终结果
     print("\n--- Final Merged Factors DataFrame ---")
-    print(all_factors_df.dropna().tail(15))
+    print(all_factors_df.info())
+
+    # 5. 保存结果
+    all_factors_df.to_csv('result/beta.csv',index=False)
+    print("factor saved")
