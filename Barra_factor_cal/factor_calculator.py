@@ -1,7 +1,8 @@
+# factor_calculator.py
+
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-import os
 from tqdm import tqdm
 from functools import reduce
 tqdm.pandas()
@@ -35,10 +36,10 @@ class FactorCalculator:
         """
         print("Preparing base data (returns, etc.)...")
         # --- 日期转换 "2020/01/01" 正序排列 ---
-        self.index_df['trade_date'] = pd.to_datetime(self.index_df['trade_date'],format='%Y%m%d')
+        #self.index_df['trade_date'] = pd.to_datetime(self.index_df['trade_date'],format='%Y%m%d')
         self.index_df['trade_date'] = self.index_df['trade_date'].dt.strftime('%Y/%m/%d')
 
-        self.prices_df['trade_date'] = pd.to_datetime(self.prices_df['trade_date'])
+        #self.prices_df['trade_date'] = pd.to_datetime(self.prices_df['trade_date'])
         self.prices_df['trade_date'] = self.prices_df['trade_date'].dt.strftime('%Y/%m/%d')
         
         self.prices_df.sort_values(by=['ts_code', 'trade_date'], inplace=True)
@@ -355,29 +356,50 @@ class FactorCalculator:
         return liquidity_df
     
 
+
     def compute_earnings_yield(self):
         """
         计算盈利因子 CETOP 和 ETOP。
+        此方法现在内部处理从单季度现金流到TTM的计算。
         - CETOP: 经营现金流TTM / 总市值
         - ETOP: 1 / PE_ttm (市盈率倒数)
         """
         print("Computing Earnings Yield factors (CETOP, ETOP)...")
 
-        # 1. 更新检查的必需列
-        # CETOP 需要 'n_cashflow_act_ttm' 和 'total_mv'
+        # 1. 检查所需的原始数据列
+        # CETOP 现在需要 'n_cashflow_act' (单季度), 'end_date', 和 'total_mv'
         # ETOP 需要 'pe_ttm'
-        required_cols = ['n_cashflow_act_ttm', 'total_mv', 'pe_ttm']
+        required_cols = ['n_cashflow_act', 'end_date', 'total_mv', 'pe_ttm']
         if not all(col in self.master_df.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in self.master_df.columns]
             print(f"\nERROR: Missing required columns for earnings yield calculation. "
-                f"Please ensure your merged data contains: {required_cols}\n")
+                  f"Please ensure your merged data contains: {missing}\n")
             return None
 
-        # --- CETOP 计算 (新逻辑) ---
+        # --- CETOP 计算 ---
+        # 2. 从主表中提取唯一的财务报告期数据，以避免重复计算
+        financial_data = self.master_df[['ts_code', 'end_date', 'n_cashflow_act']].drop_duplicates().copy()
+
+        # 3. 按股票和报告期排序，为滚动计算做准备
+        financial_data.sort_values(by=['ts_code', 'end_date'], inplace=True)
+        
+        # 4. 计算TTM值：按股票分组，对最近4个季度的现金流求和
+        financial_data['n_cashflow_act_ttm'] = financial_data.groupby('ts_code')['n_cashflow_act'].transform(
+            lambda x: x.rolling(window=4, min_periods=4).sum()
+        )
+        
+        # 5. 将计算好的TTM值合并回主数据表
+        # 我们只保留TTM列，以避免列名冲突
+        self.master_df = pd.merge(
+            self.master_df,
+            financial_data[['ts_code', 'end_date', 'n_cashflow_act_ttm']],
+            on=['ts_code', 'end_date'],
+            how='left'
+        )
+
+        # 6. 计算最终的CETOP因子
         cash_flow_ttm = self.master_df['n_cashflow_act_ttm']
         total_mv = self.master_df['total_mv']
-    
-        # 当总市值 > 0 且 现金流TTM > 0 时，因子才有意义
-        # 这与我们处理PE倒数的逻辑保持一致
         cetop_values = np.where(
             (total_mv > 0) & (cash_flow_ttm > 0),
             cash_flow_ttm / total_mv,
@@ -386,10 +408,9 @@ class FactorCalculator:
     
         # --- ETOP 计算 (逻辑不变) ---
         pe_series = self.master_df['pe_ttm']
-        # 当 PE > 0 时，因子才有意义
         etop_values = np.where(pe_series > 0, 1 / pe_series, np.nan)
     
-        # 4. 构建并返回结果 DataFrame
+        # 7. 构建并返回结果 DataFrame
         earnings_df = pd.DataFrame({
             'original_index': self.master_df['original_index'],
             'CETOP': cetop_values,
@@ -528,206 +549,3 @@ class FactorCalculator:
         final_df.drop(columns='original_index', inplace=True)
         print("Factor calculation complete.")
         return final_df
-    
-
-def winsorize_factors(factor_df: pd.DataFrame, factor_list: list, n_std: float = 2.5) -> pd.DataFrame:
-    """
-    对指定的因子列进行横截面去极值化（Winsorization）。
-    """
-    df = factor_df.copy()
-    winsorize_func = lambda x: x.clip(
-            lower=x.mean() - n_std * x.std(),
-            upper=x.mean() + n_std * x.std()
-        )
-    print(f"\n--- Starting Factor Winsorization (Boundary: Mean ± {n_std} * StdDev) ---")
-    for factor in factor_list:
-        if factor in df.columns:
-            print(f"Processing factor: '{factor}'...")
-            df[factor] = df.groupby('trade_date')[factor].transform(winsorize_func)
-        else:
-            print(f"Warning: Factor '{factor}' not found in DataFrame. Skipping.")
-    print("--- Factor Winsorization Complete ---")
-    return df
-
-def calculate_composite_factors(factor_df: pd.DataFrame, composite_factor_config: dict) -> pd.DataFrame:
-    """
-    计算一个或多个大类因子（复合因子）。
-    """
-    df = factor_df.copy()
-    for new_factor, config in composite_factor_config.items():
-        print(f"Calculating composite factor: '{new_factor}'...")
-        components = config['components']
-        weights = np.array(config['weights'])
-        numerator = pd.Series(0.0, index=df.index)
-        denominator = pd.Series(0.0, index=df.index)
-        for i, component_name in enumerate(components):
-            if component_name in df.columns:
-                numerator += df[component_name].fillna(0) * weights[i]
-                denominator += df[component_name].notna() * weights[i]
-            else:
-                print(f"Warning: Component '{component_name}' not found in DataFrame. Skipping.")
-        df[new_factor] = numerator / denominator
-    print("\n--- Composite Factor Calculation Complete ---")
-    return df
-
-def orthogonalize_factors(factor_df: pd.DataFrame, ortho_config: dict) -> pd.DataFrame:
-    """
-    对一个或多个因子进行正交化处理。
-    """
-    df = factor_df.copy()
-    def _regression(daily_df: pd.DataFrame, dependent_var: str, independent_vars: list):
-        y = daily_df[dependent_var]
-        X = daily_df[independent_vars]
-        valid_idx = pd.concat([y, X], axis=1).dropna().index
-        if len(valid_idx) < len(independent_vars) + 2:
-            return pd.Series(np.nan, index=daily_df.index)
-        y = y.loc[valid_idx]
-        X = sm.add_constant(X.loc[valid_idx])
-        model = sm.OLS(y, X).fit()
-        return model.resid.reindex(daily_df.index)
-
-    print("\n--- Starting Factor Orthogonalization ---")
-    grouped = df.groupby('trade_date')
-    for factor_to_ortho, against_factors in ortho_config.items():
-        print(f"Orthogonalizing '{factor_to_ortho}' against {against_factors}...")
-        residuals = grouped.apply(_regression, dependent_var=factor_to_ortho, independent_vars=against_factors)
-        df[factor_to_ortho] = residuals.reset_index(level=0, drop=True)
-    print("--- Factor Orthogonalization Complete ---")
-    return df
-
-    
-    
-# =================================================================
-# ========================== 如何使用 =============================
-# =================================================================
-
-if __name__ == '__main__':
-    # 1. 准备数据
-
-    # 获取当前脚本所在目录
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    #stk_path = os.path.join(BASE_DIR, "data/csi300_data_20200101_20250922.csv")
-    stk_path = os.path.join(BASE_DIR, "data/csi300_stk_data_financial_index_balance_cashflow.csv")
-    index_path = os.path.join(BASE_DIR, "data/csi_300_index_20200101_20250930.csv")
-    stk_data = pd.read_csv(stk_path)
-    index_data = pd.read_csv(index_path)
-    
-
-    # 2. 实例化计算器
-    calculator = FactorCalculator(prices_df=stk_data, index_df = index_data)
-    #master_df_output = calculator.index_df
-    #print(master_df_output.head(10))
-    
-    # 3. 指定要计算的因子列表，并运行
-    factor_list = ['SIZE','BETA', 'RSTR', 'DASTD','CMRA', 'NLSIZE','BP','LIQUIDITY','EARNINGS','GROWTH','LEVERAGE']
-    #factors_to_run = ['BETA']
-    factors_to_run = factor_list
-    raw_factors_df = calculator.run(factors_to_run)
-    print("\n--- Raw Factors DataFrame Info ---")
-    print(raw_factors_df.info())
-    
-    # 3. 对计算出的所有数值型因子进行去极值化
-    # 动态获取所有计算出的因子列（排除标识列）
-    factor_columns = [col for col in raw_factors_df.columns if col not in ['ts_code', 'trade_date']]
-    winsorized_df = winsorize_factors(raw_factors_df, factor_columns)
-
-    # 4. 计算大类风格因子（复合因子）
-    composite_config = {
-        'volatility': {
-            'components': ['DASTD', 'CMRA', 'HSIGMA'],
-            'weights': [0.7, 0.15, 0.15]
-        },
-        'leverage': {  # 避免与原始'LEVERAGE'计算步骤冲突，改个名
-            'components': ['MLEV', 'DTOA', 'BLEV'],
-            'weights': [1/3, 1/3, 1/3]
-        },
-        'liquidity':{ # 避免与原始'LIQUIDITY'计算步骤冲突，改个名
-            'components': ['STOM', 'STOQ', 'STOA'],
-            'weights': [0.5, 0.25, 0.25]
-        },
-        'earnings':{
-            'components': ['CETOP', 'ETOP'],
-            'weights': [0.5,0.5]
-        },
-        'growth':{
-            'components': ['YOYProfit', 'YOYSales'],
-            'weights': [0.5,0.5]
-        }
-    }
-    composite_df = calculate_composite_factors(winsorized_df, composite_config)
-
-    # 5. 对特定大类因子进行正交化
-    ortho_rules = {
-        'volatility': ['BETA', 'SIZE'],
-        'liquidity': ['SIZE']
-        # 注意：这里我们对合成后的流动性因子 'liquidity' 进行正交化
-    }
-    processed_df = orthogonalize_factors(composite_df, ortho_rules)
-    
-
-    # 将股票的收益率和流通市值添加到processed_df中,其中收益率是t+1期的收益率
-
-    factor_df = processed_df.copy()
-    # 调用原始数据price_df
-    price_df = calculator.prices_df[['ts_code', 'trade_date', 'ret', 'circ_mv']]
-
-    factor_df = pd.merge(factor_df, price_df, on=['ts_code', 'trade_date'], how='left')
-    factor_df['ret'] = factor_df.groupby('ts_code')['ret'].shift(-1)
-    
-    # 读取申万一级行业数据
-    sw_ind = pd.read_csv('data/stk_sw_industry.csv')
-
-    # 合并行业数据
-    factor_df = pd.merge(factor_df, sw_ind[['ts_code','l1_code']],on='ts_code')
-
-    # 修改列名
-    factor_df.rename(columns={
-        'trade_date':'date',
-        'ts_code':'stocknames',
-        'l1_code':'industry',
-        'circ_mv':'capital',
-        'SIZE':'size',
-        'BETA':'beta',
-        'RSTR':'momentum',
-        'volatility':'residual_volatility',
-        'NLSIZE':'non_linear_size',
-        'BP':'book_to_price_ratio',
-        'earnings':'earnings_yield',
-    },inplace=True)
-
-    style_factor_list = ['size','beta','momentum','residual_volatility','non_linear_size',
-               'book_to_price_ratio','liquidity','earnings_yield','growth','leverage']
-    
-    barra_data = factor_df.copy()
-    barra_data = barra_data[['date','stocknames','capital','ret','industry']+style_factor_list]
-
-    
-
-     # 6. 查看并保存最终结果
-    print("\n--- Final Barra Factors DataFrame ---")
-    print(barra_data.info())
-    print(barra_data.head())
-
-
-    # 确保 'result' 文件夹存在
-    output_dir = os.path.join(BASE_DIR, 'result')
-    os.makedirs(output_dir, exist_ok=True) 
-    
-    # 保存最终处理过的因子
-    barra_data_path = os.path.join(output_dir, 'barra_factors_1014.csv')
-    barra_data.to_csv(barra_data_path, index=False)
-    print(f"\nFinal processed factors have been saved to: {barra_data_path}")
-
-    # 生成行业信息info
-    ind_info = pd.merge(price_df[['ts_code']].drop_duplicates(), sw_ind[['ts_code','l1_code','l1_name','in_date']], on='ts_code', how='left')
-    ind_info = ind_info.drop_duplicates(subset=['l1_code', 'l1_name']).reset_index(drop=True)
-    ind_info.rename(columns={
-        'l1_code':'code',
-        'l1_name':'industry_names',
-        'in_date':'start_date'
-    },inplace=True)
-    ind_info = ind_info[['code','industry_names','start_date']]
-    ind_info.to_csv('result/industry_info_1014.csv', index=False)
-
-    print("\n--- sw industry info DataFrame ---")
-    print(ind_info.head())

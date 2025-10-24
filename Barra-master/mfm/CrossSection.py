@@ -95,7 +95,7 @@ class CrossSection():
         else:
             #求解多因子模型
             factors = np.matrix(np.hstack([self.country_factors, self.style_factors]))
-            pure_factor_portfolio_weight = np.linalg.inv(factors.T @ W @ factors) @ factors.T @ W    #纯因子组合权重
+            pure_factor_portfolio_weight = np.linalg.pinv(factors.T @ W @ factors) @ factors.T @ W    #纯因子组合权重
 
         
         factor_ret = pure_factor_portfolio_weight @ self.ret                        #纯因子收益
