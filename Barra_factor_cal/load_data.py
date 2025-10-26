@@ -3,10 +3,26 @@
 import pandas as pd
 from pymongo import MongoClient, DESCENDING
 from datetime import date
+import gc  
 
 # 配置数据库连接信息
 MONGO_CONNECTION_STRING = "mongodb://localhost:27017/"
 DB_NAME = "barra_financial_data"
+
+# 新增一个数据类型优化函数
+def optimize_dtypes(df):
+    """
+    自动将float64转换为float32，将object转换为category以节省内存。
+    """
+    print("Optimizing data types...")
+    for col in df.select_dtypes(include=['float64']).columns:
+        df[col] = df[col].astype('float32')
+    for col in df.select_dtypes(include=['int64']).columns:
+        df[col] = df[col].astype('int32')
+    # ts_code 是高频重复字符串，用 category 效率极高
+    if 'ts_code' in df.columns:
+        df['ts_code'] = df['ts_code'].astype('category')
+    return df
 
 def load_collection_to_df(db, collection_name: str, query: dict, projection: dict) -> pd.DataFrame:
     """加载经过筛选和投影的集合数据。"""
@@ -14,12 +30,22 @@ def load_collection_to_df(db, collection_name: str, query: dict, projection: dic
     collection = db[collection_name]
     cursor = collection.find(query, projection)
     df = pd.DataFrame(list(cursor))
+
+    # 加载后立即优化
+    if not df.empty:
+        df = optimize_dtypes(df)
+
     print(f"-> 成功加载 {len(df):,} 行数据。")
     return df
 
 def robust_merge_asof(left_df, right_df, left_on, right_on, by):
     """执行稳健的合并操作，确保在合并时考虑到时间序列的顺序。"""
     print(f"--- Performing robust merge_asof on '{by}' ---")
+
+    # 优化: 确保合并键也是 category
+    #if pd.api.types.is_categorical_dtype(left_df[by]) and not pd.api.types.is_categorical_dtype(right_df[by]):
+        #right_df[by] = right_df[by].astype('category')
+    
     left_df = left_df.reset_index(drop=True).sort_values(by=[by, left_on])
     right_df = right_df.reset_index(drop=True).sort_values(by=[by, right_on])
     all_keys = left_df[by].unique()
@@ -53,7 +79,7 @@ def load_and_prepare_data():
     start_date_str = "20200101"
     start_date_financial_str = "20190101"
     end_date_str = date.today().strftime('%Y%m%d')
-    index_code = "000016.SH"
+    index_code = "000016.SH"  # 上证50指数代码
 
     # ... (这里省略了所有find和load_collection_to_df的调用代码，它们保持原样) ...
     # ... (假设 constituent_list, daily_prices_df, cashflow_df, 等都已成功加载) ...
@@ -61,7 +87,6 @@ def load_and_prepare_data():
 
     # 首先连接到指数成分股集合，获取成分股列表
     index_components_collection_name = "index_components"
-    index_code = "000016.SH"
 
     # 1. 查找最新的交易日期
     print(f"\n正在为指数 '{index_code}' 查找最新交易日期...")
@@ -309,6 +334,10 @@ def load_and_prepare_data():
         by='ts_code'
     )
 
+    # 显式内存清理
+    del balance_sheet_processed_df 
+    gc.collect()
+
     merged_df_1.rename(columns={
         'f_ann_date': 'balance_sheet_f_ann_date',
     }, inplace=True)
@@ -321,6 +350,12 @@ def load_and_prepare_data():
         right_on='ann_date',
         by='ts_code'
     )
+
+    # 显式内存清理
+    del merged_df_1
+    del financial_indicators_processed_df
+    gc.collect()
+
     merged_df_2.rename(columns={
         'ann_date': 'financial_indicators_ann_date',
     }, inplace=True)
@@ -332,6 +367,12 @@ def load_and_prepare_data():
         right_on='f_ann_date',
         by='ts_code'
     )
+
+    # 显式内存清理
+    del merged_df_2
+    del cashflow_processed_df
+    gc.collect()
+
     final_merged_df.rename(columns={
         'f_ann_date': 'cashflow_f_ann_date',
     }, inplace=True)    
@@ -341,6 +382,9 @@ def load_and_prepare_data():
 
     stock_price_with_financials_df = stock_price_with_financials_df.drop(columns=columns_to_drop)
     
+    # 显式内存清理
+    del final_merged_df
+    gc.collect()
     # 缺失值处理
 
     stock_price_with_financials_df = stock_price_with_financials_df.sort_values(by=['ts_code', 'trade_date']).reset_index(drop=True)
@@ -355,18 +399,23 @@ def load_and_prepare_data():
     ]
 
     # ffill
-    stock_price_with_financials_df[fill_cols] = stock_price_with_financials_df.groupby('ts_code')[fill_cols].ffill()
+    stock_price_with_financials_df[fill_cols] = stock_price_with_financials_df.groupby('ts_code', observed=True)[fill_cols].ffill()
 
     # 用当天的横截面中位数（Median）或均值（Mean） 来填充剩余的 NaN。这相当于假设这只股票在这一天这个因子上表现“中性”，不偏离市场。
-    for col in fill_cols:
-        # 确保列是数值类型
-        if pd.api.types.is_numeric_dtype(stock_price_with_financials_df[col]):
-            # 按 'trade_date' 分组，计算中位数，然后用 transform + fillna 填充
-            stock_price_with_financials_df[col] = stock_price_with_financials_df.groupby('trade_date')[col].transform(lambda x: x.fillna(x.median()))
-
+    
     # 如果在某一天，所有股票的某个值都是 NaN（比如数据刚开始的几天），
     # 那么中位数也是 NaN。这时可以用 0 或全局 ffill/bfill 来彻底清理。
     stock_price_with_financials_df[fill_cols] = stock_price_with_financials_df[fill_cols].fillna(0)
+    grouped_by_date = stock_price_with_financials_df.groupby('trade_date')
+    
+    for col in fill_cols:
+        if pd.api.types.is_numeric_dtype(stock_price_with_financials_df[col]):
+            # 1. 预先计算每日中位数
+            median_map = grouped_by_date[col].median()
+            # 2. 使用 map 填充
+            stock_price_with_financials_df[col] = stock_price_with_financials_df[col].fillna(
+                stock_price_with_financials_df['trade_date'].map(median_map)
+            )
 
     stock_price_with_financials_df['end_date'] = pd.to_datetime(stock_price_with_financials_df['end_date'])
     stock_price_with_financials_df['balance_sheet_f_ann_date'] = pd.to_datetime(stock_price_with_financials_df['balance_sheet_f_ann_date'])

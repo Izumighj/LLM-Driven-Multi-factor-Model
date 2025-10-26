@@ -4,7 +4,8 @@ import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from tqdm import tqdm
-from functools import reduce
+#from functools import reduce
+import gc
 tqdm.pandas()
 
 class FactorCalculator:
@@ -179,16 +180,18 @@ class FactorCalculator:
             return np.sqrt(weighted_var)
 
         tqdm.pandas(desc="DASTD Calculation per Stock")
+        # <优化：将Python列表循环改为Pandas的 rolling().apply() ---
         dastd_s = self.master_df.groupby('ts_code')['excess_ret'].progress_apply(
-            lambda x: pd.Series(
-                [_dastd_calc(w, weights) for w in x.rolling(window=T, min_periods=MIN_PERIODS)],
-                index=x.index  
-            ),
+            lambda x: x.rolling(window=T, min_periods=MIN_PERIODS)
+                         .apply(_dastd_calc, args=(weights,), raw=False),
             include_groups=False
         )
+        # --- 结束修改 ---
     
         dastd_df = dastd_s.reset_index()
         dastd_df.rename(columns={'excess_ret': 'DASTD', 'level_1': 'original_index'}, inplace=True)
+        # 清理临时列
+        self.master_df.drop(columns=['excess_ret'], inplace=True)
     
         return dastd_df[['original_index', 'DASTD']]
 
@@ -201,6 +204,10 @@ class FactorCalculator:
         T = 252
     
         def _cmra_calc(window_series):
+            # 优化: 确保窗口期足够 ---
+            if window_series.shape[0] < T:
+                 return np.nan
+            # --- 结束修改 ---
             # 窗口内对数收益率的累积和
             cum_log_ret = window_series.cumsum()
             # 累积收益率 Z(t) 的路径
@@ -213,13 +220,13 @@ class FactorCalculator:
 
         tqdm.pandas(desc="CMRA Calculation per Stock")
 
+        # 优化：将Python列表循环改为Pandas的 rolling().apply() ---
         cmra_s = self.master_df.groupby('ts_code')['log_ret'].progress_apply(
-            lambda x: pd.Series(
-                [_cmra_calc(w) for w in x.rolling(window=T)],
-                index=x.index  
-            ),
+            lambda x: x.rolling(window=T)
+                         .apply(_cmra_calc, raw=False), # raw=False 因为 _cmra_calc 需要 pandas Series
             include_groups=False
         )
+        # --- 结束修改 ---
     
         cmra_df = cmra_s.reset_index()
         cmra_df.rename(columns={'log_ret': 'CMRA', 'level_1': 'original_index'}, inplace=True)
@@ -334,15 +341,19 @@ class FactorCalculator:
         grouped_dtv = dtv.groupby(self.master_df['ts_code'])
 
     
-        tqdm.pandas(desc="Calculating rolling turnover")
-        stom_base = grouped_dtv.progress_apply(lambda x: x.rolling(window=21, min_periods=15).sum())
-        stoq_base = grouped_dtv.progress_apply(lambda x: x.rolling(window=63, min_periods=42).sum())
-        stoa_base = grouped_dtv.progress_apply(lambda x: x.rolling(window=252, min_periods=126).sum())
+        # <--- 3. 优化：移除多余的 progress_apply，直接在 groupby.rolling 上计算 ---
+        print("Calculating STOM...")
+        stom_base = grouped_dtv.rolling(window=21, min_periods=15).sum()
+        print("Calculating STOQ...")
+        stoq_base = grouped_dtv.rolling(window=63, min_periods=42).sum()
+        print("Calculating STOA...")
+        stoa_base = grouped_dtv.rolling(window=252, min_periods=126).sum()
     
-        # 对累计换手率取对数。np.log(0)会得到-inf，所以我们处理小于等于0的情况
-        stom = np.log(stom_base.replace(0, np.nan))
-        stoq = np.log(stoq_base.replace(0, np.nan))
-        stoa = np.log(stoa_base.replace(0, np.nan))
+        # 结果是 MultiIndex, 我们需要去掉 'ts_code' 级别以匹配 'original_index'
+        stom = np.log(stom_base.droplevel(0).replace(0, np.nan))
+        stoq = np.log(stoq_base.droplevel(0).replace(0, np.nan))
+        stoa = np.log(stoa_base.droplevel(0).replace(0, np.nan))
+        # --- 结束修改 ---
 
         # 构建并返回结果 DataFrame
         liquidity_df = pd.DataFrame({
@@ -387,19 +398,19 @@ class FactorCalculator:
         financial_data['n_cashflow_act_ttm'] = financial_data.groupby('ts_code')['n_cashflow_act'].transform(
             lambda x: x.rolling(window=4, min_periods=4).sum()
         )
-        
-        # 5. 将计算好的TTM值合并回主数据表
-        # 我们只保留TTM列，以避免列名冲突
-        self.master_df = pd.merge(
-            self.master_df,
+
+        # 优化：不修改 self.master_df，而是创建一个临时DF ---
+        temp_df = pd.merge(
+            self.master_df[['original_index', 'ts_code', 'end_date', 'total_mv', 'pe_ttm']],
             financial_data[['ts_code', 'end_date', 'n_cashflow_act_ttm']],
             on=['ts_code', 'end_date'],
             how='left'
         )
+        # 确保索引与 master_df 一致 (merge后可能乱序)
+        temp_df.sort_values(by='original_index', inplace=True)
 
-        # 6. 计算最终的CETOP因子
-        cash_flow_ttm = self.master_df['n_cashflow_act_ttm']
-        total_mv = self.master_df['total_mv']
+        cash_flow_ttm = temp_df['n_cashflow_act_ttm']
+        total_mv = temp_df['total_mv']
         cetop_values = np.where(
             (total_mv > 0) & (cash_flow_ttm > 0),
             cash_flow_ttm / total_mv,
@@ -407,15 +418,18 @@ class FactorCalculator:
         )
     
         # --- ETOP 计算 (逻辑不变) ---
-        pe_series = self.master_df['pe_ttm']
+        pe_series = temp_df['pe_ttm']
         etop_values = np.where(pe_series > 0, 1 / pe_series, np.nan)
     
-        # 7. 构建并返回结果 DataFrame
         earnings_df = pd.DataFrame({
-            'original_index': self.master_df['original_index'],
+            'original_index': temp_df['original_index'],
             'CETOP': cetop_values,
             'ETOP': etop_values
         })
+        
+        del temp_df # 清理临时DF
+        gc.collect()
+        # --- 结束修改 ---
     
         return earnings_df
 
@@ -523,28 +537,40 @@ class FactorCalculator:
             # ... 在这里继续添加映射 ...
         }
         
-        results_list = [self.master_df[['ts_code', 'trade_date', 'original_index']]]
         
-        # --- 【核心修改】用tqdm包裹因子列表的循环 ---
-        # tqdm会自动创建一个进度条
-        # desc参数为进度条提供一个固定的描述
-        #progress_bar = tqdm(factors, desc="Overall Factor Calculation")
-        for factor_name in factors:
-            # (可选，但推荐) 动态更新进度条描述，显示当前正在计算的因子
-            #progress_bar.set_description(f"Processing {factor_name}")
-            
+        
+        # <--- 5. 【核心修改】优化合并策略 ---
+        # 不再使用 results_list 和 reduce
+        
+        # 1. 初始化一个基础DataFrame
+        final_df = self.master_df[['ts_code', 'trade_date', 'original_index', 'ret', 'circ_mv']].copy()
+        
+        # 2. 迭代计算和合并
+        print("\nIteratively computing and merging factors...")
+        for factor_name in tqdm(factors, desc="Overall Factor Calculation"):
             method = factor_methods.get(factor_name.upper())
-            if method:
-                factor_df = method()
-                if factor_df is not None:
-                    # 我们只返回 original_index 和因子值，避免列名冲突
-                    results_list.append(factor_df)
-            else:
+            if not method:
                 print(f"Warning: Factor '{factor_name}' not found.")
+                continue
+                
+            # 计算因子
+            factor_df = method()
+            
+            if factor_df is not None:
+                # 立即合并
+                final_df = pd.merge(
+                    final_df, 
+                    factor_df, 
+                    on='original_index', 
+                    how='left'
+                )
+                # 立即删除中间表并回收内存
+                del factor_df
+                gc.collect()
+            else:
+                print(f"Warning: Method for '{factor_name}' returned None.")
         
-        print("\nMerging all factor results...")
-        final_df = reduce(lambda left, right: pd.merge(left, right, on='original_index', how='left'), 
-                          results_list)
+        # --- 结束修改 ---
         
         final_df.drop(columns='original_index', inplace=True)
         print("Factor calculation complete.")
